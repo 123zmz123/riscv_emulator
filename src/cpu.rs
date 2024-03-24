@@ -3,12 +3,14 @@
 use crate::bus::*;
 use crate::exception::*;
 use crate::param::*;
+use crate::csr::*;
 
 
 pub struct Cpu{
     pub regs: [u64; 32],
     pub pc: u64,
     pub bus: Bus,
+    pub csr: Csr,
 }
 
 const RVABI: [&str; 32] = [
@@ -24,7 +26,8 @@ impl Cpu {
         regs[2] = DRAM_END;
         let pc = DRAM_BASE;
         let bus = Bus::new(code);
-        Self {regs, pc, bus}
+        let csr = Csr::new();
+        Self {regs, pc, bus,csr}
     }
 
     pub fn reg(&self, r: &str) -> u64 {
@@ -40,6 +43,24 @@ impl Cpu {
                     }
                     panic!("Invalid register {}", r);
                 }
+                "mhartid"=>self.csr.load(MHARTID),
+                "mstatus"=>self.csr.load(MSTATUS),
+                "mtvec"=>self.csr.load(MTVEC), // trap vec array address
+                "mepc"=>self.csr.load(MEPC), // machine exception pc
+                "mcause"=>self.csr.load(MCAUSE),// indicate which event cause the trap?
+                "mtval"=>self.csr.load(MTVAL),// faulting information in different mode
+                "medeleg"=>self.csr.load(MEDELEG),// the recorded trap can handle by lower privilege level.
+                "mscratch"=>self.csr.load(MSCRATCH),// pointer to a context switch
+                "MIP"=>self.csr.load(MIP), // M-Mode what intterrupt are pending?
+                "mcounteren"=>self.csr.load(MCOUNTEREN),
+                "sstatus"=>self.csr.load(SSTATUS), // S-mode current processor state.
+                "stvec"=>self.csr.load(STVEC), //S-mode trap vec array address
+                "sepc"=>self.csr.load(SEPC),// S-Mode exception PC
+                "scause"=>self.csr.load(SCAUSE),// S-Mode indicate which event cause the trap
+                "stval"=>self.csr.load(STVAL),// additional fault information when trap occured
+                "sscratch"=>self.csr.load(SSCRATCH),// S-Mode pointer to context switch
+                "SIP"=>self.csr.load(SIP),// S-mode what interrupt are pending
+                "SATP"=>self.csr.load(SATP),//S-mode page table related regs
                 _ => panic!("Invalid register {}", r),
             }
         }
@@ -71,6 +92,9 @@ impl Cpu {
         }
 
         println!("{}", output);
+    }
+    pub fn dump_csrs(&self) {
+        self.csr.dump_csrs();
     }
 
     pub fn load(&mut self, addr: u64, size: u64)->Result<u64, Exception>{
@@ -263,6 +287,7 @@ impl Cpu {
             }
             
             0x23 => {
+
                 let imm = (((instr & 0xfe000000) as i32 as i64 >> 20) as u64) | ((instr >> 7) & 0x1f);
                 let addr = self.regs[rs1].wrapping_add(imm);
                 match funct3 {
@@ -467,6 +492,63 @@ impl Cpu {
                     | ((instr >> 9) & 0x800) // imm[11]
                     | ((instr >> 20) & 0x7fe); // imm[10:1]
                 return Ok(self.pc.wrapping_add(imm));
+            }
+
+            0x73 => {
+                let csr_addr = ((instr&0xfff00000)>>20) as usize;
+                match funct3 {
+                    0x1 => {
+                        // csrrw
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr,self.regs[rs1]);
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+
+                    0x2 => {
+                        // csrrs
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr, t | self.regs[rs1]);
+                        self.regs[rd]=t;
+                        return self.update_pc();
+                    }
+
+                    0x3 => {
+                        // csrrc
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr,t&(!self.regs[rs1]));
+                        self.regs[rd]=t;
+                        return self.update_pc();
+                    }
+
+                    0x5 => {
+                        // csrrwi
+                        let zimm = rs1 as u64;
+                        self.regs[rd]=self.csr.load(csr_addr);
+                        self.csr.store(csr_addr,zimm);
+                        return self.update_pc();
+                    }
+
+                    0x6 => {
+                        //csrrsi
+                        let zimm = rs1 as u64;
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr, t|zimm);
+                        self.regs[rd]=t;
+                        return self.update_pc();
+                    }
+
+                    0x7 => {
+                        //csrrci
+                        let zimm = rs1 as u64;
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr,t & (!zimm));
+                        self.regs[rd]=t;
+                        return self.update_pc();
+                    }
+                    
+                    _ => Err(Exception::IllegalInstruction(instr)),
+                }
             }
             _ => Err(Exception::IllegalInstruction(instr)),
         }
@@ -735,6 +817,25 @@ mod test {
             addw a2, a0, a1
         ";
         riscv_test!(code, "test_word_op", 29, "a2" => 0x7f00002a);
+    }
+
+    #[test]
+    fn test_csrs1() {
+        let code = "
+        addi t0, zero, 1
+        addi t1, zero, 2
+        addi t2, zero, 3
+        csrrw zero, mstatus, t0
+        csrrs zero, mtvec, t1
+        csrrw zero, mepc, t2
+        csrrc t2, mepc, zero
+        csrrwi zero, sstatus, 4
+        csrrsi zero, stvec, 5
+        csrrwi zero, sepc, 6
+        csrrci zero, sepc, 0 
+    ";
+    riscv_test!(code, "test_csrs1", 20, "mstatus" => 1, "mtvec" => 2, "mepc" => 3,
+                                        "sstatus" => 0, "stvec" => 5, "sepc" => 6);
     }
 
 }
