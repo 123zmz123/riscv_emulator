@@ -5,10 +5,15 @@ use crate::exception::*;
 use crate::param::*;
 use crate::csr::*;
 
+type Mode = u64;
+const User: Mode = 0b00;
+const Supervisor: Mode = 0b01;
+const Machine: Mode = 0b11;
 
 pub struct Cpu{
     pub regs: [u64; 32],
     pub pc: u64,
+    pub mode: Mode,
     pub bus: Bus,
     pub csr: Csr,
 }
@@ -27,7 +32,8 @@ impl Cpu {
         let pc = DRAM_BASE;
         let bus = Bus::new(code);
         let csr = Csr::new();
-        Self {regs, pc, bus,csr}
+        let mode = Machine;
+        Self {regs, pc, bus,csr,mode}
     }
 
     pub fn reg(&self, r: &str) -> u64 {
@@ -180,6 +186,16 @@ impl Cpu {
                 }
             }
 
+            0x0f => {
+                match funct3 {
+                    // we do not implement fence at here
+                    0x0 => {
+                        return self.update_pc();
+                    }
+                    _ => Err(Exception::IllegalInstruction(instr)),
+                }
+            }
+
             0x13 => { // addi,slti,sltiu,xori,ori,andi
                 let imm = ((instr & 0xfff00000) as i32 as i64 >> 20) as u64;
                 let shamt = (imm & 0x3f) as u32;
@@ -298,6 +314,43 @@ impl Cpu {
                     _ => unreachable!(),
                 }
             }
+
+            0x2f => { // atomic function which means all the operation happen at a single time unit
+                let funct5 = (funct7 & 0b1111100) >> 2;
+                let _aq = (funct7 & 0b0000010) >> 1;
+                let _rl = funct7 & 0b0000001;
+                match (funct3,funct5) {
+                    (0x2,0x00)=>{
+                        // amoadd.w
+                        let t = self.load(self.regs[rs1],32)?;
+                        self.store(self.regs[rs1],32,t.wrapping_add(self.regs[rs2]))?;
+                        self.regs[rd]=t;
+                        return self.update_pc();
+                    }
+                    (0x3,0x00)=>{
+                        //amoadd.d
+                        let t = self.load(self.regs[rs1],64)?;
+                        self.store(self.regs[rs1],64,t.wrapping_add(self.regs[rs2]))?;
+                        self.regs[rd]=t;
+                        return self.update_pc();
+                    }
+                    (0x2,0x01)=>{
+                        //amoswap.w
+                        let t = self.load(self.regs[rs1],32)?;
+                        self.store(self.regs[rs1],32,self.regs[rs2])?;
+                        self.regs[rd]=t;
+                        return self.update_pc();
+                    }
+                    (0x3,0x01)=>{
+                        //amoswap.d
+                        let t = self.load(self.regs[rs1],64)?;
+                        self.store(self.regs[rs1],64,self.regs[rs2])?;
+                        self.regs[rd]=t;
+                        return self.update_pc();
+                    }
+                    _ => Err(Exception::IllegalInstruction(instr)),
+                }
+            }
             0x33 => {
                 let shamt = ((self.regs[rs2] & 0x3f) as u64) as u32;
                 match (funct3, funct7) {
@@ -406,10 +459,33 @@ impl Cpu {
                         self.regs[rd] = (self.regs[rs1] as u32).wrapping_shr(shamt) as i32 as u64;
                         return self.update_pc();
                     }
-
+                    (0x5,0x01) => {
+                        // divu
+                        self.regs[rd] = match self.regs[rs2] {
+                            0 => 0xffffffff_ffffffff,
+                            _ => {
+                                let dividend = self.regs[rs1];
+                                let divisor = self.regs[rs2];
+                                dividend.wrapping_div(divisor)
+                            }
+                        };
+                        return self.update_pc();
+                    }
                     (0x5, 0x20) => {
                         // sraw
                         self.regs[rd] = ((self.regs[rs1] as i32) >> (shamt as i32)) as u64;
+                        return self.update_pc();
+                    }
+                    (0x7,0x01) => {
+                        // remuw
+                        self.regs[rd] = match self.regs[rs2] {
+                            0 => self.regs[rs1],
+                            _ => {
+                                let dividend = self.regs[rs1] as u32;
+                                let divisor = self.regs[rs2] as u32;
+                                dividend.wrapping_rem(divisor) as i32 as u64
+                            }
+                        };
                         return self.update_pc();
                     }
 
@@ -470,7 +546,6 @@ impl Cpu {
                         }
                         return self.update_pc();
                     }
-
                     _ => Err(Exception::IllegalInstruction(instr)),
                 }
             }
@@ -497,6 +572,46 @@ impl Cpu {
             0x73 => {
                 let csr_addr = ((instr&0xfff00000)>>20) as usize;
                 match funct3 {
+                    0x0 => {
+                        match(rs2,funct7){
+                            (0x2,0x8)=>{
+                                // sret
+                                let mut sstatus = self.csr.load(SSTATUS);
+                                self.mode = (sstatus & MASK_SPP) >> 8; // pre-exception privilege mode
+                                let spie = (sstatus & MASK_SPIE) >> 5;
+                                // SIE = SPIE
+                                sstatus = (sstatus & !MASK_SIE) | (spie << 1);
+                                // set the SPP as the u-mode
+                                sstatus &= !MASK_SPP;
+                                self.csr.store(SSTATUS, sstatus);
+                                //When a trap is taken into S-mode, sepc is written with the virtual address of the instruction that
+                                //encountered the exception
+                                let new_pc = self.csr.load(SEPC) & !0b11;
+                                return Ok(new_pc);
+                            }
+                            (0x2,0x18) => {
+                                // mret
+                                let mut mstatus = self.csr.load(MSTATUS);
+                                //
+                                self.mode = (mstatus & MASK_MPP) >> 11; // previous privilege mode
+                                let mpie = (mstatus & MASK_MPIE) >> 7;
+                                //
+                                mstatus = (mstatus & !MASK_MIE) | (mpie<<3);//mie = mpie
+                                mstatus |= MASK_MPIE;//MPIE = 1
+                                mstatus &= !MASK_MPP;
+                                mstatus &= !MASK_MPRV;
+                                self.csr.store(MSTATUS,mstatus);
+                                let new_pc = self.csr.load(MEPC) & !0b11;
+                                return Ok(new_pc);
+                            }
+                            (_,0x9)=>{
+                                // sfence.vma
+                                // Do nothing.
+                                return self.update_pc();
+                            }
+                            _ => Err(Exception::IllegalInstruction(instr)),
+                        }
+                    }
                     0x1 => {
                         // csrrw
                         let t = self.csr.load(csr_addr);
