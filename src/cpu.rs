@@ -102,7 +102,35 @@ impl Cpu {
     pub fn dump_csrs(&self) {
         self.csr.dump_csrs();
     }
+    pub fn handle_exception(&mut self, e:Exception){
+        let pc = self.pc;
+        let mode = self.mode;
+        let cause = e.code();
+        // by default all exception were handled in M mode, but by mdelegate reg some can hanle in lower privelege
+        // mode
+        let trap_in_s_mode = mode <= Supervisor && self.csr.is_medelegated(cause);
+        let (STATUS, TVEC, CAUSE, TVAL,EPC,MASK_PIE,pie_i,MASK_IE,ie_i,MASK_PP,pp_i) 
+            = if trap_in_s_mode{
+                self.mode = Supervisor;
+                (SSTATUS,STVEC,SCAUSE,STVAL,SEPC,MASK_SPIE,5,MASK_SIE,1,MASK_SPP,8) // ref rv64 sstatus define
 
+            }else{
+                self.mode = Machine;
+                 (MSTATUS, MTVEC, MCAUSE, MTVAL, MEPC, MASK_MPIE, 7, MASK_MIE, 3, MASK_MPP, 11)
+            };
+        // pc = vector table address
+        self.pc = self.csr.load(TVEC) & !0b11;
+        // record the pc number that encounter the exception
+        self.csr.store(EPC, pc);
+        self.csr.store(CAUSE, cause);
+        self.csr.store(TVAL, e.value());
+        let mut status = self.csr.load(STATUS);
+        let ie = (status & MASK_IE) >> ie_i;
+        status = (status & !MASK_PIE) | (ie << pie_i);
+        status &= !MASK_IE;
+        status = (status & !MASK_PP) | (mode << pp_i);
+        self.csr.store(STATUS, status);
+    }
     pub fn load(&mut self, addr: u64, size: u64)->Result<u64, Exception>{
         self.bus.load(addr, size)
     }
@@ -112,7 +140,10 @@ impl Cpu {
     }
 
     pub fn fetch(&mut self)->Result<u64,Exception>{
-        self.bus.load(self.pc, 32)
+        match self.bus.load(self.pc, 32) {
+            Ok(instr) => Ok(instr),
+            Err(_e) => Err(Exception::InstructionAccessFault(self.pc)),
+        }
     }
 
     pub fn update_pc(&mut self)->Result<u64, Exception>{
@@ -229,8 +260,8 @@ impl Cpu {
                         self.regs[rd] = self.regs[rs1]^imm;
                         return self.update_pc();
                     }
-                    0x5=>{
-                        match funct7>>1 {
+                    0x5 => {
+                        match funct7 >> 1 {
                             //srli
                             0x00 => {
                                 self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
@@ -574,6 +605,19 @@ impl Cpu {
                 match funct3 {
                     0x0 => {
                         match(rs2,funct7){
+                            (0x0,0x0) => {
+                                match self.mode {
+                                    User => Err(Exception::EnvironmentCallFromUMode(self.pc)),
+                                    Supervisor => Err(Exception::EnvironmentCallFromSMode(self.pc)),
+                                    Machine => Err(Exception::EnvironmentCallFromMMode(self.pc)),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            (0x1,0x0)=>{
+                                // ebreak
+                                // debugger raise a request breakpoint
+                                return Err(Exception::Breakpoint(self.pc));
+                            }
                             (0x2,0x8)=>{
                                 // sret
                                 let mut sstatus = self.csr.load(SSTATUS);
