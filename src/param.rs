@@ -1,3 +1,21 @@
 pub const DRAM_BASE:u64 = 0x8000_0000;
 pub const DRAM_SIZE:u64 = 1024*1024*128;
 pub const DRAM_END:u64 = DRAM_BASE+DRAM_SIZE-1;
+
+
+pub const CLINT_BASE :u64 = 0x200_0000;
+pub const CLINT_SIZE: u64 = 0x10000;
+pub const CLINT_END: u64 = CLINT_BASE + CLINT_SIZE -1;
+
+pub const CLINT_MTIMECMP: u64 = CLINT_BASE + 0x4000;
+pub const CLINT_MTIME: u64 = CLINT_BASE + 0xbff8;
+
+
+pub const PLIC_BASE: u64 = 0xc00_0000;
+pub const PLIC_SIZE: u64 = 0x4000000;
+pub const PLIC_END: u64 = PLIC_BASE + PLIC_SIZE -1;
+
+pub const PLIC_PENDING: u64 = PLIC_BASE + 0x1000;
+pub const PLIC_SENABLE: u64 = PLIC_BASE + 0x2000;
+pub const PLIC_SPRIORITY: u64 = PLIC_BASE + 0x201000;
+pub const PLIC_SCLAIM: u64 = PLIC_BASE + 0x201004;
