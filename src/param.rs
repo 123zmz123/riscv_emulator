@@ -19,3 +19,22 @@ pub const PLIC_PENDING: u64 = PLIC_BASE + 0x1000;
 pub const PLIC_SENABLE: u64 = PLIC_BASE + 0x2000;
 pub const PLIC_SPRIORITY: u64 = PLIC_BASE + 0x201000;
 pub const PLIC_SCLAIM: u64 = PLIC_BASE + 0x201004;
+
+// UART
+pub const UART_BASE: u64 = 0x1000_0000;
+pub const UART_SIZE: u64 = 0x100;
+pub const UART_END: u64 = UART_BASE+UART_SIZE-1;
+// uart interrupt request
+pub const UART_IRQ: u64 = 10;
+// receive holding register
+pub const UART_RHR: u64 = 0;
+// send holding register
+pub const UART_THR: u64 = 0;
+//
+pub const UART_LCR: u64 = 3;
+
+pub const  UART_LSR: u64 = 5;
+
+pub const MASK_UART_LSR_RX: u8 = 1;
+
+pub const MASK_UART_LSR_TX:u8 = 1<<5;
