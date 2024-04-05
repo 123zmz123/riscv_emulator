@@ -7,6 +7,9 @@ mod csr;
 mod plic;
 mod clint;
 mod uart;
+mod interrupt;
+mod virtqueue;
+mod virtio;
 
 
 use std::env;
@@ -26,10 +29,16 @@ fn main() -> io::Result<()> {
     let mut binary = Vec::new();
     file.read_to_end(&mut binary)?;
 
-    let mut cpu = Cpu::new(binary);
+    let mut disk_image = Vec::new();
+    if args.len() == 3 {
+        let mut file = File::open(&args[2])?;
+        file.read_to_end(&mut disk_image)?;
+    }
+
+    let mut cpu = Cpu::new(binary, disk_image); // load code to dram
 
     loop {
-        let inst = match cpu.fetch() {
+        let inst = match cpu.fetch() { //fetch a instruction
             // Break the loop if an error occurs.
             Ok(inst) => inst,
             Err(e) => {
@@ -53,6 +62,11 @@ fn main() -> io::Result<()> {
                 }
             }
         };
+
+        match cpu.check_pending_interrupt() {
+            Some(interrupt) => cpu.handle_interrupt(interrupt),
+            None => (),
+        }
 
     }
     cpu.dump_registers();

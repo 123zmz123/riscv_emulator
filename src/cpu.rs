@@ -1,9 +1,11 @@
 #![allow(dead_code)]
-
+use std::mem::size_of;
 use crate::bus::*;
 use crate::exception::*;
+use crate::interrupt::*;
 use crate::param::*;
 use crate::csr::*;
+use crate::virtqueue::*;
 
 type Mode = u64;
 const User: Mode = 0b00;
@@ -26,11 +28,11 @@ const RVABI: [&str; 32] = [
 ];
 
 impl Cpu {
-    pub fn new(code: Vec<u8>) -> Self {
+    pub fn new(code: Vec<u8>,disk_image:Vec<u8>) -> Self {
         let mut regs = [0; 32];
         regs[2] = DRAM_END;
         let pc = DRAM_BASE;
-        let bus = Bus::new(code);
+        let bus = Bus::new(code,disk_image);
         let csr = Csr::new();
         let mode = Machine;
         Self {regs, pc, bus,csr,mode}
@@ -110,9 +112,9 @@ impl Cpu {
         // mode
         let trap_in_s_mode = mode <= Supervisor && self.csr.is_medelegated(cause);
         let (STATUS, TVEC, CAUSE, TVAL,EPC,MASK_PIE,pie_i,MASK_IE,ie_i,MASK_PP,pp_i) 
-            = if trap_in_s_mode{
+            = if trap_in_s_mode {
                 self.mode = Supervisor;
-                (SSTATUS,STVEC,SCAUSE,STVAL,SEPC,MASK_SPIE,5,MASK_SIE,1,MASK_SPP,8) // ref rv64 sstatus define
+                (SSTATUS, STVEC, SCAUSE, STVAL, SEPC, MASK_SPIE, 5, MASK_SIE, 1, MASK_SPP, 8) // ref rv64 sstatus define
 
             }else{
                 self.mode = Machine;
@@ -130,6 +132,185 @@ impl Cpu {
         status &= !MASK_IE;
         status = (status & !MASK_PP) | (mode << pp_i);
         self.csr.store(STATUS, status);
+    }
+
+    pub fn handle_interrupt(&mut self, interrupt: Interrupt) {
+        // similar to exception
+        let pc = self.pc; // store the pc before get into intterrupt
+        let mode = self.mode;// store the mode before get into intterupt
+        let cause = interrupt.code();
+
+        let trap_in_s_mode = mode <= Supervisor && self.csr.is_midelegated(cause);
+
+        let (STATUS, TVEC, CAUSE, TVAL, EPC, MASK_PIE, pie_i, MASK_IE, ie_i, MASK_PP, pp_i) 
+            = if trap_in_s_mode {
+                self.mode = Supervisor;
+                (SSTATUS, STVEC, SCAUSE, STVAL, SEPC, MASK_SPIE, 5, MASK_SIE, 1, MASK_SPP, 8)
+            } else {
+                self.mode = Machine;
+                (MSTATUS, MTVEC, MCAUSE, MTVAL, MEPC, MASK_MPIE, 7, MASK_MIE, 3, MASK_MPP, 11)
+            };
+            //
+            //
+            //
+            //
+            //
+            let tvec = self.csr.load(TVEC); // vector base address reg
+            let tvec_mode = tvec & 0b11;
+            let tvec_base = tvec & !0b11;
+            match tvec_mode {
+                0 => self.pc = tvec_base,
+                1 => self.pc = tvec_base + cause << 2,
+                _ => unreachable!(),
+            };
+            //
+            // When a trap is taken into S-mode (or M-mode), sepc (or mepc) is written with the virtual address 
+            // of the instruction that was interrupted or that encountered the exception.
+            self.csr.store(EPC,pc); // record the pc address which cause the interrupt
+            //
+            // When a trap is taken into S-mode (or M-mode), scause (or mcause) is written with a code indicating 
+            // the event that caused the trap.
+            self.csr.store(CAUSE,cause);
+            //
+            // When a trap is taken into M-mode, mtval is either set to zero or written with exception-specific 
+            // information to assist software in handling the trap. 
+            self.csr.store(TVAL, 0);
+            // prepare for manipulate sstatus or msstatus register
+            let mut status = self.csr.load(STATUS);
+            // get SIE or MIE value
+            let ie = (status & MASK_IE) >> ie_i;
+            // set PIE = IE
+            status = (status & !MASK_PIE) | (ie << pie_i);
+            // IE set to zero
+            status &= !MASK_IE;
+            // record previous mode 
+            status = (status & !MASK_PP) | (mode << pp_i);
+            self.csr.store(STATUS,status);
+        
+    }
+
+    pub fn check_pending_interrupt(&mut self) -> Option<Interrupt>{
+        use Interrupt::*;
+        // 3.1.6.1
+        // When a hart is executing in privilege mode x, interrupts are globally enabled when x IE=1 and globally 
+        // disabled when xIE=0. Interrupts for lower-privilege modes, w<x, are always globally disabled regardless 
+        // of the setting of any global wIE bit for the lower-privilege mode. Interrupts for higher-privilege modes, 
+        // y>x, are always globally enabled regardless of the setting of the global yIE bit for the higher-privilege 
+        // mode. Higher-privilege-level code can use separate per-interrupt enable bits to disable selected higher-
+        // privilege-mode interrupts before ceding control to a lower-privilege mode
+ 
+        // 3.1.9 & 4.1.3
+        // An interrupt i will trap to M-mode (causing the privilege mode to change to M-mode) if all of
+        // the following are true: (a) either the current privilege mode is M and the MIE bit in the mstatus
+        // register is set, or the current privilege mode has less privilege than M-mode; (b) bit i is set in both
+        // mip and mie; and (c) if register mideleg exists, bit i is not set in mideleg.
+        if (self.mode == Machine) && (self.csr.load(MSTATUS) & MASK_MIE) == 0 {
+            return None;
+        }
+        if (self.mode == Supervisor) && (self.csr.load(SSTATUS) & MASK_SIE) == 0 {
+            return None;
+        }
+        
+        // In fact, we should using priority to decide which interrupt should be handled first.
+        if self.bus.uart.is_interrupting() {
+            self.bus.store(PLIC_SCLAIM, 32, UART_IRQ).unwrap();
+            self.csr.store(MIP, self.csr.load(MIP) | MASK_SEIP); 
+        } else if self.bus.virtio_blk.is_interrupting() {
+            self.disk_access();
+            self.bus.store(PLIC_SCLAIM, 32, VIRTIO_IRQ).unwrap();
+            self.csr.store(MIP, self.csr.load(MIP) | MASK_SEIP);
+        }
+        // 3.1.9 & 4.1.3
+        // Multiple simultaneous interrupts destined for M-mode are handled in the following decreasing
+        // priority order: MEI, MSI, MTI, SEI, SSI, STI.
+        let pending = self.csr.load(MIE) & self.csr.load(MIP);
+
+        if (pending & MASK_MEIP) != 0 {
+            self.csr.store(MIP, self.csr.load(MIP) & !MASK_MEIP);
+            return Some(MachineExternalInterrupt);
+        }
+        if (pending & MASK_MSIP) != 0 {
+            self.csr.store(MIP, self.csr.load(MIP) & !MASK_MSIP);
+            return Some(MachineSoftwareInterrupt);
+        }
+        if (pending & MASK_MTIP) != 0 {
+            self.csr.store(MIP, self.csr.load(MIP) & !MASK_MTIP);
+            return Some(MachineTimerInterrupt);
+        }
+        if (pending & MASK_SEIP) != 0 {
+            self.csr.store(MIP, self.csr.load(MIP) & !MASK_SEIP);
+            return Some(SupervisorExternalInterrupt);
+        }
+        if (pending & MASK_SSIP) != 0 {
+            self.csr.store(MIP, self.csr.load(MIP) & !MASK_SSIP);
+            return Some(SupervisorSoftwareInterrupt);
+        }
+        if (pending & MASK_STIP) != 0 {
+            self.csr.store(MIP, self.csr.load(MIP) & !MASK_STIP);
+            return Some(SupervisorTimerInterrupt);
+        }
+        return None;
+    }
+        pub fn disk_access(&mut self) {
+        const desc_size: u64 = size_of::<VirtqDesc>() as u64;
+        // 2.6.2 Legacy Interfaces: A Note on Virtqueue Layout
+        // ------------------------------------------------------------------
+        // Descriptor Table  | Available Ring | (...padding...) | Used Ring
+        // ------------------------------------------------------------------
+        let desc_addr = self.bus.virtio_blk.desc_addr();
+        let avail_addr = desc_addr + DESC_NUM as u64 * desc_size;
+        let used_addr = desc_addr + PAGE_SIZE;
+
+        // cast addr to a reference to ease field access.
+        let virtq_avail = unsafe { &(*(avail_addr as *const VirtqAvail)) };
+        let virtq_used  = unsafe { &(*(used_addr  as *const VirtqUsed)) };
+
+        // The idx field of virtq_avail should be indexed into available ring to get the
+        // index of descriptor we need to process.
+        let idx = self.bus.load(&virtq_avail.idx as *const _ as u64, 16).unwrap() as usize;
+        let index = self.bus.load(&virtq_avail.ring[idx % DESC_NUM] as *const _ as u64, 16).unwrap();
+
+        // The first descriptor:
+        // which contains the request information and a pointer to the data descriptor.
+        let desc_addr0 = desc_addr + desc_size * index;
+        let virtq_desc0 = unsafe { &(*(desc_addr0 as *const VirtqDesc)) };
+        // The addr field points to a virtio block request. We need the sector number stored 
+        // in the sector field. The iotype tells us whether to read or write.
+        let req_addr = self.bus.load(&virtq_desc0.addr as *const _ as u64, 64).unwrap();
+        let virtq_blk_req = unsafe { &(*(req_addr as *const VirtioBlkRequest)) };
+        let blk_sector = self.bus.load(&virtq_blk_req.sector as *const _ as u64, 64).unwrap();
+        let iotype = self.bus.load(&virtq_blk_req.iotype as *const _ as u64, 32).unwrap() as u32;
+        // The next field points to the second descriptor. (data descriptor)
+        let next0  = self.bus.load(&virtq_desc0.next  as *const _ as u64, 16).unwrap();
+
+        // the second descriptor. 
+        let desc_addr1 = desc_addr + desc_size * next0;
+        let virtq_desc1 = unsafe { &(*(desc_addr1 as *const VirtqDesc)) };
+        // The addr field points to the data to read or write
+        let addr1  = self.bus.load(&virtq_desc1.addr  as *const _ as u64, 64).unwrap();
+        // the len donates the size of the data
+        let len1   = self.bus.load(&virtq_desc1.len   as *const _ as u64, 32).unwrap();
+        // the flags mark this buffer as device write-only or read-only.
+        // We ignore it here
+        // let flags1 = self.bus.load(&virtq_desc1.flags as *const _ as u64, 16).unwrap();
+        match iotype {
+            VIRTIO_BLK_T_OUT => {
+                for i in 0..len1 {
+                    let data = self.bus.load(addr1 + i, 8).unwrap();
+                    self.bus.virtio_blk.write_disk(blk_sector * SECTOR_SIZE + i, data);
+                }
+            }
+            VIRTIO_BLK_T_IN => {
+                for i in 0..len1 {
+                    let data = self.bus.virtio_blk.read_disk(blk_sector * SECTOR_SIZE + i);
+                    self.bus.store(addr1 + i, 8, data as u64).unwrap();
+                }
+            } 
+            _ => unreachable!(),
+        }       
+
+        let new_id = self.bus.virtio_blk.get_new_id();
+        self.bus.store(&virtq_used.idx as *const _ as u64, 16, new_id % 8).unwrap();
     }
     pub fn load(&mut self, addr: u64, size: u64)->Result<u64, Exception>{
         self.bus.load(addr, size)
@@ -786,7 +967,9 @@ mod test {
         let mut file_bin = File::open(testname.to_owned() + ".bin")?;
         let mut code = Vec::new();
         file_bin.read_to_end(&mut code)?;
-        let mut cpu = Cpu::new(code);
+        //leave disk_image empty do not affect our test. test case do not require 
+        // disk_image
+        let mut cpu = Cpu::new(code, vec![]); 
 
         for _i in 0..n_clock {
             let instr = match cpu.fetch() {
