@@ -12,12 +12,19 @@ const User: Mode = 0b00;
 const Supervisor: Mode = 0b01;
 const Machine: Mode = 0b11;
 
+pub enum AccessType {
+    Instruction,
+    Load,
+    Store,
+}
 pub struct Cpu{
     pub regs: [u64; 32],
     pub pc: u64,
     pub mode: Mode,
     pub bus: Bus,
     pub csr: Csr,
+    pub enable_paging: bool,
+    pub page_table: u64,
 }
 
 const RVABI: [&str; 32] = [
@@ -28,14 +35,16 @@ const RVABI: [&str; 32] = [
 ];
 
 impl Cpu {
-    pub fn new(code: Vec<u8>,disk_image:Vec<u8>) -> Self {
+    pub fn new(code: Vec<u8>, disk_image: Vec<u8>) -> Self {
         let mut regs = [0; 32];
         regs[2] = DRAM_END;
         let pc = DRAM_BASE;
-        let bus = Bus::new(code,disk_image);
+        let bus = Bus::new(code, disk_image);
         let csr = Csr::new();
         let mode = Machine;
-        Self {regs, pc, bus,csr,mode}
+        let page_table = 0;
+        let enable_paging = false;
+        Self {regs, pc, bus, csr, mode, page_table, enable_paging}
     }
 
     pub fn reg(&self, r: &str) -> u64 {
@@ -114,9 +123,10 @@ impl Cpu {
         let (STATUS, TVEC, CAUSE, TVAL,EPC,MASK_PIE,pie_i,MASK_IE,ie_i,MASK_PP,pp_i) 
             = if trap_in_s_mode {
                 self.mode = Supervisor;
-                (SSTATUS, STVEC, SCAUSE, STVAL, SEPC, MASK_SPIE, 5, MASK_SIE, 1, MASK_SPP, 8) // ref rv64 sstatus define
+                // ref rv64 sstatus define
+                (SSTATUS, STVEC, SCAUSE, STVAL, SEPC, MASK_SPIE, 5, MASK_SIE, 1, MASK_SPP, 8) 
 
-            }else{
+            } else {
                 self.mode = Machine;
                  (MSTATUS, MTVEC, MCAUSE, MTVAL, MEPC, MASK_MPIE, 7, MASK_MIE, 3, MASK_MPP, 11)
             };
@@ -155,7 +165,8 @@ impl Cpu {
             //
             //
             //
-            let tvec = self.csr.load(TVEC); // vector base address reg
+             // vector base address reg
+            let tvec = self.csr.load(TVEC);
             let tvec_mode = tvec & 0b11;
             let tvec_base = tvec & !0b11;
             match tvec_mode {
@@ -166,11 +177,11 @@ impl Cpu {
             //
             // When a trap is taken into S-mode (or M-mode), sepc (or mepc) is written with the virtual address 
             // of the instruction that was interrupted or that encountered the exception.
-            self.csr.store(EPC,pc); // record the pc address which cause the interrupt
+            self.csr.store(EPC, pc); // record the pc address which cause the interrupt
             //
             // When a trap is taken into S-mode (or M-mode), scause (or mcause) is written with a code indicating 
             // the event that caused the trap.
-            self.csr.store(CAUSE,cause);
+            self.csr.store(CAUSE, cause);
             //
             // When a trap is taken into M-mode, mtval is either set to zero or written with exception-specific 
             // information to assist software in handling the trap. 
@@ -185,7 +196,7 @@ impl Cpu {
             status &= !MASK_IE;
             // record previous mode 
             status = (status & !MASK_PP) | (mode << pp_i);
-            self.csr.store(STATUS,status);
+            self.csr.store(STATUS, status);
         
     }
 
@@ -251,7 +262,7 @@ impl Cpu {
         }
         return None;
     }
-        pub fn disk_access(&mut self) {
+    pub fn disk_access(&mut self) {
         const desc_size: u64 = size_of::<VirtqDesc>() as u64;
         // 2.6.2 Legacy Interfaces: A Note on Virtqueue Layout
         // ------------------------------------------------------------------
@@ -312,21 +323,150 @@ impl Cpu {
         let new_id = self.bus.virtio_blk.get_new_id();
         self.bus.store(&virtq_used.idx as *const _ as u64, 16, new_id % 8).unwrap();
     }
-    pub fn load(&mut self, addr: u64, size: u64)->Result<u64, Exception>{
-        self.bus.load(addr, size)
+
+    fn update_paging(&mut self, csr_addr: usize){
+        // satp is control register of virtual address feature
+        if csr_addr != SATP { return; }
+        let satp = self.csr.load(SATP);
+        self.page_table = (satp & MASK_PPN) * PAGE_SIZE;  // vector base address reg
+        // focus on stap 0bxxx..... highest 4 bit
+        let mode = satp >> 60; 
+        self.enable_paging = mode == 8;
+    }
+
+    /// Translate a virtual address to a physical address for the paged virtual-dram system.
+    pub fn translate(&mut self, addr:u64, access_type:AccessType) -> Result<u64,Exception> {
+        if !self.enable_paging {
+            return Ok(addr);
+        }
+
+        let levels = 3;
+        // sv39 va_addres -> index of each level PTE + offset
+        let vpn = [
+            (addr >> 12) & 0x1ff,
+            (addr >> 21) & 0x1ff,
+            (addr >> 30) & 0x1ff,
+        ];
+        //1. Let a be satp.ppn × PAGESIZE, and let i = LEVELS − 1.
+        let mut a = self.page_table;
+        let mut i: i64 = levels - 1;
+        let mut pte;
+        
+        loop {
+            // "2. Let pte be the value of the PTE at address a+va.vpn[i]×PTESIZE. (For Sv39,
+            //     PTESIZE=8.) If accessing pte violates a PMA or PMP check, raise an access
+            //     exception corresponding to the original access type."
+            pte = self.bus.load(a + vpn[i as usize] * 8, 64)?;
+
+            // "3. If pte.v = 0, or if pte.r = 0 and pte.w = 1, stop and raise a page-fault
+            //     exception corresponding to the original access type."
+            let v = pte & 1;
+            let r = (pte >> 1) & 1;
+            let w = (pte >> 2) & 1;
+            let x = (pte >> 3) & 1;
+            if v == 0 || (r == 0 && w == 1) {
+                match access_type {
+                    AccessType::Instruction => return Err(Exception::InstructionPageFault(addr)),
+                    AccessType::Load => return Err(Exception::LoadPageFault(addr)),
+                    AccessType::Store => return Err(Exception::StoreAMOPageFault(addr)),
+                }
+            }
+
+            // "4. Otherwise, the PTE is valid. If pte.r = 1 or pte.x = 1, go to step 5.
+            //     Otherwise, this PTE is a pointer to the next level of the page table.
+            //     Let i = i − 1. If i < 0, stop and raise a page-fault exception
+            //     corresponding to the original access type. Otherwise,
+            //     let a = pte.ppn × PAGESIZE and go to step 2."
+            if r == 1 || x == 1 {
+                break;
+            }
+            i -= 1;
+            // pte = |ppn|flags|
+            let ppn = (pte >> 10) & 0x0fff_ffff_ffff;
+            // accoring ppn recalculate next level pte table address.
+            a = ppn * PAGE_SIZE;
+            if i < 0 {
+                match access_type {
+                    AccessType::Instruction => return Err(Exception::InstructionPageFault(addr)),
+                    AccessType::Load => return Err(Exception::LoadPageFault(addr)),
+                    AccessType::Store => return Err(Exception::StoreAMOPageFault(addr)),
+                }
+            }
+        }
+
+        // A leaf PTE has been found.
+        let ppn = [
+            (pte >> 10) & 0x1ff,
+            (pte >> 19) & 0x1ff,
+            (pte >> 28) & 0x03ff_ffff,
+        ];
+
+        // We skip implementing from step 5 to 7.
+
+        // "5. A leaf PTE has been found. Determine if the requested dram access is allowed by
+        //     the pte.r, pte.w, pte.x, and pte.u bits, given the current privilege mode and the
+        //     value of the SUM and MXR fields of the mstatus register. If not, stop and raise a
+        //     page-fault exception corresponding to the original access type."
+
+        // "6. If i > 0 and pte.ppn[i − 1 : 0] ̸= 0, this is a misaligned superpage; stop and
+        //     raise a page-fault exception corresponding to the original access type."
+
+        // "7. If pte.a = 0, or if the dram access is a store and pte.d = 0, either raise a
+        //     page-fault exception corresponding to the original access type, or:
+        //     • Set pte.a to 1 and, if the dram access is a store, also set pte.d to 1.
+        //     • If this access violates a PMA or PMP check, raise an access exception
+        //     corresponding to the original access type.
+        //     • This update and the loading of pte in step 2 must be atomic; in particular, no
+        //     intervening store to the PTE may be perceived to have occurred in-between."
+
+        // "8. The translation is successful. The translated physical address is given as
+        //     follows:
+        //     • pa.pgoff = va.pgoff.
+        //     • If i > 0, then this is a superpage translation and pa.ppn[i−1:0] =
+        //     va.vpn[i−1:0].
+        //     • pa.ppn[LEVELS−1:i] = pte.ppn[LEVELS−1:i]."
+        let offset = addr & 0xfff;
+        match i {
+            0 => {
+                let ppn = (pte >> 10) & 0x0fff_ffff_ffff;
+                Ok((ppn << 12) | offset)
+            }
+            1 => {
+                // Superpage translation. A superpage is a dram page of larger size than an
+                // ordinary page (4 KiB). It reduces TLB misses and improves performance.
+                Ok((ppn[2] << 30) | (ppn[1] << 21) | (vpn[0] << 12) | offset)
+            }
+            2 => {
+                // Superpage translation. A superpage is a dram page of larger size than an
+                // ordinary page (4 KiB). It reduces TLB misses and improves performance.
+                Ok((ppn[2] << 30) | (vpn[1] << 21) | (vpn[0] << 12) | offset)
+            }
+            _ => match access_type {
+                AccessType::Instruction => return Err(Exception::InstructionPageFault(addr)),
+                AccessType::Load => return Err(Exception::LoadPageFault(addr)),
+                AccessType::Store => return Err(Exception::StoreAMOPageFault(addr)),
+            },
+        }
+    }
+    
+    pub fn load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
+        let p_addr = self.translate(addr, AccessType::Load)?;
+        self.bus.load(p_addr, size)
     }
 
     pub fn store(&mut self, addr:u64, size: u64, value: u64)->Result<(), Exception>{
-        self.bus.store(addr, size, value)
+        let p_addr = self.translate(addr,AccessType::Store)?;
+        self.bus.store(p_addr, size, value)
     }
 
     pub fn fetch(&mut self)->Result<u64,Exception>{
-        match self.bus.load(self.pc, 32) {
+        let p_pc = self.translate(self.pc, AccessType::Instruction)?;
+        match self.bus.load(p_pc, 32) {
             Ok(instr) => Ok(instr),
             Err(_e) => Err(Exception::InstructionAccessFault(self.pc)),
         }
     }
-
+    #[inline]
     pub fn update_pc(&mut self)->Result<u64, Exception>{
         return Ok(self.pc + 4);
     }
@@ -855,6 +995,7 @@ impl Cpu {
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr,self.regs[rs1]);
                         self.regs[rd] = t;
+                        self.update_paging(csr_addr);
                         return self.update_pc();
                     }
 
@@ -863,6 +1004,7 @@ impl Cpu {
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, t | self.regs[rs1]);
                         self.regs[rd]=t;
+                        self.update_paging(csr_addr);
                         return self.update_pc();
                     }
 
@@ -871,6 +1013,7 @@ impl Cpu {
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr,t&(!self.regs[rs1]));
                         self.regs[rd]=t;
+                        self.update_paging(csr_addr);
                         return self.update_pc();
                     }
 
@@ -879,6 +1022,7 @@ impl Cpu {
                         let zimm = rs1 as u64;
                         self.regs[rd]=self.csr.load(csr_addr);
                         self.csr.store(csr_addr,zimm);
+                        self.update_paging(csr_addr);
                         return self.update_pc();
                     }
 
@@ -888,6 +1032,7 @@ impl Cpu {
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, t|zimm);
                         self.regs[rd]=t;
+                        self.update_paging(csr_addr);
                         return self.update_pc();
                     }
 
@@ -897,6 +1042,7 @@ impl Cpu {
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr,t & (!zimm));
                         self.regs[rd]=t;
+                        self.update_paging(csr_addr);
                         return self.update_pc();
                     }
                     

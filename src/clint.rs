@@ -14,7 +14,7 @@ impl Clint {
         Self { mtime: 0, mtimecmp: 0 }
     }
 
-    pub fn load(&self, addr:u64, size:u64) -> Result<u64, Exception> {
+    pub fn load(&self, addr: u64, size: u64) -> Result<u64, Exception> {
         if size != 64 {
             return Err(LoadAccessFault(addr));
         }
@@ -32,9 +32,9 @@ impl Clint {
         }
 
         match addr {
-            CLINT_MTIMECMP => Ok(self.mtimecmp=value),
-            CLINT_MTIME => Ok(self.mtime=value),
-            _=>Err(StoreAMOAccessFault(addr)),
+            CLINT_MTIMECMP => Ok(self.mtimecmp = value),
+            CLINT_MTIME => Ok(self.mtime = value),
+            _ => Err(StoreAMOAccessFault(addr)),
         }
     }
 }

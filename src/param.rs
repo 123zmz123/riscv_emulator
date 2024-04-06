@@ -96,3 +96,5 @@ pub const VIRTIO_BLK_T_OUT: u32 = 1;
 pub const VIRTQ_DESC_F_NEXT: u16 = 1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 2;
 pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
+
+pub const PTESIZE:u64 = 8;
