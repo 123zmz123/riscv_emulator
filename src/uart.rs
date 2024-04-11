@@ -51,7 +51,7 @@ impl Uart {
     Self { uart, interrupt }
    } 
 
-   pub fn is_interrupting(&self) -> bool {
+   pub fn is_interrupted(&self) -> bool {
        self.interrupt.swap(false, Ordering::Acquire)
    }
 

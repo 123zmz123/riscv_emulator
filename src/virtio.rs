@@ -42,7 +42,7 @@ impl  VirtioBlock {
             disk,
         }
     }
-    pub fn is_interrupting(&mut self) -> bool {
+    pub fn is_interrupted(&mut self) -> bool {
         if self.queue_notify < MAX_BLOCK_QUEUE {
             self.queue_notify = MAX_BLOCK_QUEUE;
             return true;

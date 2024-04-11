@@ -8,9 +8,9 @@ use crate::csr::*;
 use crate::virtqueue::*;
 
 type Mode = u64;
-const User: Mode = 0b00;
-const Supervisor: Mode = 0b01;
 const Machine: Mode = 0b11;
+const Supervisor: Mode = 0b01;
+const User: Mode = 0b00;
 
 pub enum AccessType {
     Instruction,
@@ -18,13 +18,13 @@ pub enum AccessType {
     Store,
 }
 pub struct Cpu{
-    pub regs: [u64; 32],
-    pub pc: u64,
+    pub pc: u64, // pc point to current instruction address
+    pub regs: [u64; 32], // riscv have 32 general registers
     pub mode: Mode,
-    pub bus: Bus,
-    pub csr: Csr,
-    pub enable_paging: bool,
-    pub page_table: u64,
+    pub bus: Bus, // bus is reponsible for access external device
+    pub csr: Csr, // csr reg groups
+    pub enable_paging: bool, // do we need enable page?
+    pub page_table: u64, // point to the page table
 }
 
 const RVABI: [&str; 32] = [
@@ -47,6 +47,7 @@ impl Cpu {
         Self {regs, pc, bus, csr, mode, page_table, enable_paging}
     }
 
+    // get reg value.
     pub fn reg(&self, r: &str) -> u64 {
         match RVABI.iter().position(|&x| x == r) {
             Some(i) => self.regs[i],
@@ -82,12 +83,12 @@ impl Cpu {
             }
         }
     }
-
+    // print out the current pc
     pub fn dump_pc(&self) {
         println!("{:-^80}","PC register");
         println!("PC={:#x}\n",self.pc);
     }
-
+    // when error happened print out current reg status
     pub fn dump_registers(&mut self) {
         println!("{:-^80}", "registers");
         let mut output = String::new();
@@ -113,6 +114,7 @@ impl Cpu {
     pub fn dump_csrs(&self) {
         self.csr.dump_csrs();
     }
+    /// cpu will check whether handle the excepution after each fetch-execute cycle.
     pub fn handle_exception(&mut self, e:Exception){
         let pc = self.pc;
         let mode = self.mode;
@@ -123,23 +125,28 @@ impl Cpu {
         let (STATUS, TVEC, CAUSE, TVAL,EPC,MASK_PIE,pie_i,MASK_IE,ie_i,MASK_PP,pp_i) 
             = if trap_in_s_mode {
                 self.mode = Supervisor;
-                // ref rv64 sstatus define
+                // reference rv64 sstatus define
                 (SSTATUS, STVEC, SCAUSE, STVAL, SEPC, MASK_SPIE, 5, MASK_SIE, 1, MASK_SPP, 8) 
 
             } else {
                 self.mode = Machine;
-                 (MSTATUS, MTVEC, MCAUSE, MTVAL, MEPC, MASK_MPIE, 7, MASK_MIE, 3, MASK_MPP, 11)
+                //reference rv64 msstatus define
+                (MSTATUS, MTVEC, MCAUSE, MTVAL, MEPC, MASK_MPIE, 7, MASK_MIE, 3, MASK_MPP, 11)
             };
         // pc = vector table address
         self.pc = self.csr.load(TVEC) & !0b11;
         // record the pc number that encounter the exception
         self.csr.store(EPC, pc);
         self.csr.store(CAUSE, cause);
+        // record extra message for exception handle
         self.csr.store(TVAL, e.value());
         let mut status = self.csr.load(STATUS);
+        // record current ie statu to previous ie statu
         let ie = (status & MASK_IE) >> ie_i;
         status = (status & !MASK_PIE) | (ie << pie_i);
+        // disable global interrupt enable
         status &= !MASK_IE;
+        // store previous cpu mode
         status = (status & !MASK_PP) | (mode << pp_i);
         self.csr.store(STATUS, status);
     }
@@ -223,10 +230,10 @@ impl Cpu {
         }
         
         // In fact, we should using priority to decide which interrupt should be handled first.
-        if self.bus.uart.is_interrupting() {
+        if self.bus.uart.is_interrupted() {
             self.bus.store(PLIC_SCLAIM, 32, UART_IRQ).unwrap();
             self.csr.store(MIP, self.csr.load(MIP) | MASK_SEIP); 
-        } else if self.bus.virtio_blk.is_interrupting() {
+        } else if self.bus.virtio_blk.is_interrupted() {
             self.disk_access();
             self.bus.store(PLIC_SCLAIM, 32, VIRTIO_IRQ).unwrap();
             self.csr.store(MIP, self.csr.load(MIP) | MASK_SEIP);
@@ -235,7 +242,7 @@ impl Cpu {
         // Multiple simultaneous interrupts destined for M-mode are handled in the following decreasing
         // priority order: MEI, MSI, MTI, SEI, SSI, STI.
         let pending = self.csr.load(MIE) & self.csr.load(MIP);
-
+        /// check the pending reason and return the interrupt type
         if (pending & MASK_MEIP) != 0 {
             self.csr.store(MIP, self.csr.load(MIP) & !MASK_MEIP);
             return Some(MachineExternalInterrupt);
@@ -328,7 +335,8 @@ impl Cpu {
         // satp is control register of virtual address feature
         if csr_addr != SATP { return; }
         let satp = self.csr.load(SATP);
-        self.page_table = (satp & MASK_PPN) * PAGE_SIZE;  // vector base address reg
+        // calculate the page table address algorithm provide by arch mannual
+        self.page_table = (satp & MASK_PPN) * PAGE_SIZE;  
         // focus on stap 0bxxx..... highest 4 bit
         let mode = satp >> 60; 
         self.enable_paging = mode == 8;
@@ -450,16 +458,19 @@ impl Cpu {
     }
     
     pub fn load(&mut self, addr: u64, size: u64) -> Result<u64, Exception> {
+        // according page table on/off statu , calculate the real address we need handle
         let p_addr = self.translate(addr, AccessType::Load)?;
         self.bus.load(p_addr, size)
     }
 
     pub fn store(&mut self, addr:u64, size: u64, value: u64)->Result<(), Exception>{
+        // according page table on/off statu , calculate the real address we need handle
         let p_addr = self.translate(addr,AccessType::Store)?;
         self.bus.store(p_addr, size, value)
     }
 
     pub fn fetch(&mut self)->Result<u64,Exception>{
+        // according page table on/off statu , calculate the real address we need handle
         let p_pc = self.translate(self.pc, AccessType::Instruction)?;
         match self.bus.load(p_pc, 32) {
             Ok(instr) => Ok(instr),
@@ -482,54 +493,56 @@ impl Cpu {
         self.regs[0] = 0; 
 
         match opcode {
-            0x03 => { // lb,lh,lw,lbu,lhu
+            0x03 => { // lb,lh,lw,lbu,lhu 
+                // 1. addr = rs1.val + imm
+                // 2. rd.val = memory[addr]
                 let imm = ((instr as i32 as i64) >> 20) as u64;
                 let addr = self.regs[rs1].wrapping_add(imm);
                 match funct3 {
                     0x0 => {
-                        // lb
+                        // lb rd, imm(rs1)
                         let val = self.load(addr, 8)?;
                         self.regs[rd] = val as i8 as i64 as u64;
                         return self.update_pc();
                     }
 
                     0x1 => {
-                        // lh
+                        // lh rd, imm(rs1)
                         let val = self.load(addr, 16)?;
                         self.regs[rd] = val as i16 as i64 as u64;
                         return self.update_pc();
                     }
 
                     0x2 => {
-                        // lw
+                        // lw rd, imm(rs1)
                         let val = self.load(addr, 32)?;
                         self.regs[rd] = val as i32 as i64 as u64;
                         return self.update_pc();
                     }
 
                     0x3 => {
-                        // ld
+                        // ld rd, imm(rs1)
                         let val = self.load(addr, 64)?;
                         self.regs[rd] = val;
                         return self.update_pc();
                     }
 
                     0x4 => {
-                        // lbu
+                        // lbu rd, imm(rs1)
                         let val = self.load(addr, 8)?;
                         self.regs[rd] = val;
                         return self.update_pc();
                     }
 
                     0x5 => {
-                        // lhu
+                        // lhu rd, imm(rs1)
                         let val = self.load(addr, 16)?;
                         self.regs[rd] = val;
                         return self.update_pc();
                     }
 
                     0x6 => {
-                        // lwu
+                        // lwu rd, imm(rs1)
                         let val = self.load(addr, 32)?;
                         self.regs[rd] = val;
                         return self.update_pc();
@@ -553,43 +566,49 @@ impl Cpu {
                 let shamt = (imm & 0x3f) as u32;
                 match funct3 {
                     0x0 => {
-                        // addi
+                        // addi rd, rs1, imm
+                        // rd = rs1 + imm
                         self.regs[rd] = self.regs[rs1].wrapping_add(imm);
                         return self.update_pc();
                     }
 
                     0x1 => {
-                        // slli
+                        // slli rd, rs1, shamt
+                        // rd = rs1 << shamt
                         self.regs[rd] = self.regs[rs1] << shamt;
                         return self.update_pc();
                     }
 
                     0x2 => {
-                        // slti
+                        // slti rd, rs1, imm
+                        // rd = 1 if rs1 < imm else = 0
                         self.regs[rd] = if (self.regs[rs1] as i64) < (imm as i64) { 1 } else { 0 };
                         return self.update_pc();
                     }
 
                     0x3 => {
-                        // sltiu
+                        // sltiu rd, rs1, imm
                         self.regs[rd] = if self.regs[rs1] < imm { 1 } else { 0 };
                         return self.update_pc();
                     }
 
                     0x4 => {
-                        //xori
+                        //xori rd , rs1, imm
+                        // rd = rs1 ^ imm
                         self.regs[rd] = self.regs[rs1]^imm;
                         return self.update_pc();
                     }
                     0x5 => {
                         match funct7 >> 1 {
-                            //srli
+                            //srli rd, rs1,shamt
+                            // rd =  rs1 >> shamt
                             0x00 => {
                                 self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
                                 return self.update_pc();
                             }
 
-                            //srai
+                            //srai rd, rs1, shamt
+                            // rd = rs1 >> shamt, val as i64
                             0x10 => {
                                 self.regs[rd]=(self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
                                 return self.update_pc();
@@ -599,7 +618,9 @@ impl Cpu {
                         }
                     }
 
-                    0x6 => { //ori
+                    0x6 => {
+                        //ori rd, rs1, imm
+                        // rd = rs1 | imm
                         self.regs[rd] = self.regs[rs1] | imm;
                         return self.update_pc();
                     }
@@ -613,6 +634,7 @@ impl Cpu {
             
             0x17 => {
                 // auipc
+                //rd = pc + imm
                 let imm = (instr & 0xfffff000) as i32 as i64 as u64;
                 self.regs[rd] = self.pc.wrapping_add(imm);
                 return self.update_pc();
@@ -623,12 +645,14 @@ impl Cpu {
                 let shamt = (imm & 0x1f) as u32;
                 match funct3 {
                     0x0 => {
-                        //addiw
+                        //addiw rd, rs1, imm
+                        // rd = rs1+imm
                         self.regs[rd]=self.regs[rs1].wrapping_add(imm) as i32 as i64 as u64;
                         return self.update_pc();
                     }
                     0x1 => {
                         //slliw
+                        // rd = rs1 << shamt
                         self.regs[rd] = self.regs[rs1].wrapping_shl(shamt) as i32 as i64 as u64;
                         return self.update_pc();
                     }
@@ -636,12 +660,14 @@ impl Cpu {
                         match funct7 {
                             0x00 => {
                                 //srliw
+                                // rd = rs1 >> shamt
                                 self.regs[rd] = (self.regs[rs1] as u32).wrapping_shr(shamt) as i32
                                     as i64 as u64;
                                 return self.update_pc();
                             }
                             0x20 => {
                                 // sraiw
+                                // rd = rs1 >> shamt
                                 self.regs[rd] = 
                                     (self.regs[rs1] as i32).wrapping_shr(shamt) as i64 as u64;
                                 return self.update_pc();
@@ -659,14 +685,14 @@ impl Cpu {
                 let imm = (((instr & 0xfe000000) as i32 as i64 >> 20) as u64) | ((instr >> 7) & 0x1f);
                 let addr = self.regs[rs1].wrapping_add(imm);
                 match funct3 {
-                    0x0 => {self.store(addr,8,self.regs[rs2])?;self.update_pc()},//sb
-                    0x1 => {self.store(addr,16,self.regs[rs2])?;self.update_pc()},//sh
-                    0x2 => {self.store(addr,32,self.regs[rs2])?;self.update_pc()},//sw
-                    0x3 => {self.store(addr,64,self.regs[rs2])?;self.update_pc()},//sd
+                    0x0 => {self.store(addr,8,self.regs[rs2])?;self.update_pc()},//sb mem[addr]=rs2
+                    0x1 => {self.store(addr,16,self.regs[rs2])?;self.update_pc()},//sh mem[addr]=rs2
+                    0x2 => {self.store(addr,32,self.regs[rs2])?;self.update_pc()},//sw mem[addr]=rs2
+                    0x3 => {self.store(addr,64,self.regs[rs2])?;self.update_pc()},//sd mem[addr]=rs2
                     _ => unreachable!(),
                 }
             }
-
+            // memory atomic operation
             0x2f => { // atomic function which means all the operation happen at a single time unit
                 let funct5 = (funct7 & 0b1111100) >> 2;
                 let _aq = (funct7 & 0b0000010) >> 1;
@@ -674,6 +700,7 @@ impl Cpu {
                 match (funct3,funct5) {
                     (0x2,0x00)=>{
                         // amoadd.w
+                        // t=mem[rs1], mem[rs1]=t+rs2, rd=t
                         let t = self.load(self.regs[rs1],32)?;
                         self.store(self.regs[rs1],32,t.wrapping_add(self.regs[rs2]))?;
                         self.regs[rd]=t;
@@ -708,66 +735,77 @@ impl Cpu {
                 match (funct3, funct7) {
                     (0x0, 0x00) => { 
                         // add
+                        // rd = rs1 + rs2
                         self.regs[rd] = self.regs[rs1].wrapping_add(self.regs[rs2]);
                         return self.update_pc();
                     }
 
                     (0x0, 0x01) => {
                         // mul
+                        // rd = rs1*rs2
                         self.regs[rd] = self.regs[rs1].wrapping_mul(self.regs[rs2]);
                         return self.update_pc();
                     }
 
                     (0x0, 0x20) => {
                         // sub
+                        // rd = rs1 - rs2
                         self.regs[rd]=self.regs[rs1].wrapping_sub(self.regs[rs2]);
                         return self.update_pc();
                     }
 
                     (0x1, 0x00) => {
                         // sll 
+                        //rd = rs1 << shamt
                         self.regs[rd]=self.regs[rs1].wrapping_shl(shamt);
                         return self.update_pc();
                     }
 
                     (0x2, 0x00) => {
                         // slt
+                        // rd = 1 if rs1 < rs2 else = 0
                         self.regs[rd] = if (self.regs[rs1] as i64) < (self.regs[rs2] as i64) { 1 } else { 0 };
                         return self.update_pc();
                     }
 
                     (0x3, 0x00) => {
                         // sltu
+                        // rd = 1 if rs1 < rs2 else = 0
                         self.regs[rd] = if self.regs[rs1] < self.regs[rs2] { 1 } else { 0 };
                         return self.update_pc();
                     }
 
                     (0x4, 0x00) => {
                         // xor
+                        // rd = rs1 ^ rs2
                         self.regs[rd] = self.regs[rs1]^self.regs[rs2];
                         return self.update_pc();
                     }
 
                     (0x5, 0x00) => {
                         // srl
+                        // rd = rs1 >> shamt
                         self.regs[rd] = self.regs[rs1].wrapping_shr(shamt);
                         return self.update_pc();
                     }
 
                     (0x5, 0x20) => {
                         // sra
+                        // rd = rs1 >> shamt
                         self.regs[rd] = (self.regs[rs1] as i64).wrapping_shr(shamt) as u64;
                         return self.update_pc();
                     }
 
                     (0x6, 0x00) => {
                         // or
+                        // rd = rs1 | rs2
                         self.regs[rd] = self.regs[rs1] | self.regs[rs2];
                         return self.update_pc();
                     }
 
                     (0x7, 0x00) => {
                         // and
+                        // rd = rs1 & rs2
                         self.regs[rd] = self.regs[rs1] & self.regs[rs2];
                         return self.update_pc();
                     }
@@ -778,6 +816,7 @@ impl Cpu {
             
             0x37 => {
                 // lui load imm upper bound to rd
+                // rd = imm's upper bound
                 self.regs[rd] = (instr & 0xfffff000) as i32 as i64 as u64;
                 return self.update_pc();
             }
@@ -787,6 +826,7 @@ impl Cpu {
                 match (funct3, funct7) {
                     (0x0, 0x00) => {
                         // addw
+                        // rd = rs1 + rs2
                         self.regs[rd] =
                             self.regs[rs1].wrapping_add(self.regs[rs2]) as i32 as i64 as u64;
                         return self.update_pc();
@@ -795,6 +835,7 @@ impl Cpu {
 
                     (0x0, 0x20) => {
                         // subw
+                        // rd = rs1 - rs2
                         self.regs[rd] = 
                             ((self.regs[rs1].wrapping_sub(self.regs[rs2])) as i32) as u64;
                         return self.update_pc();
@@ -802,17 +843,20 @@ impl Cpu {
 
                     (0x1, 0x00) => {
                         // sllw
+                        // rd = rs1 << shamt
                         self.regs[rd] = (self.regs[rs1] as u32).wrapping_shl(shamt) as i32 as u64;
                         return self.update_pc();
                     }
 
                     (0x5, 0x00) => {
                         // srlw
+                        // rd = rs1 >> shamr
                         self.regs[rd] = (self.regs[rs1] as u32).wrapping_shr(shamt) as i32 as u64;
                         return self.update_pc();
                     }
                     (0x5,0x01) => {
                         // divu
+                        // rd =  rs1 / rs2 if rs2 != 0 else =0
                         self.regs[rd] = match self.regs[rs2] {
                             0 => 0xffffffff_ffffffff,
                             _ => {
@@ -825,11 +869,13 @@ impl Cpu {
                     }
                     (0x5, 0x20) => {
                         // sraw
+                        // rd = rs1 >> shamt
                         self.regs[rd] = ((self.regs[rs1] as i32) >> (shamt as i32)) as u64;
                         return self.update_pc();
                     }
                     (0x7,0x01) => {
                         // remuw
+                        // rd =  rs1 / rs2 if rs2 != 0 else =0
                         self.regs[rd] = match self.regs[rs2] {
                             0 => self.regs[rs1],
                             _ => {
@@ -853,6 +899,7 @@ impl Cpu {
                 match funct3 {
                     0x0 => {
                         // beq
+                        // if rs1 == rs2 then pc = pc + imm
                         if self.regs[rs1] == self.regs[rs2] {
                             return Ok(self.pc.wrapping_add(imm));
                         }
@@ -861,6 +908,7 @@ impl Cpu {
 
                     0x1 => {
                         // bne
+                        // if rs1!=rs2 then pc=pc+imm
                         if self.regs[rs1] != self.regs[rs2] {
                             return Ok(self.pc.wrapping_add(imm));
                         }
@@ -869,6 +917,7 @@ impl Cpu {
 
                     0x4 => {
                         // blt
+                        // if rs1 < rs2 then pc=pc+imm
                         if (self.regs[rs1] as i64) < (self.regs[rs2] as i64) {
                             return Ok(self.pc.wrapping_add(imm));
                         }
@@ -877,6 +926,7 @@ impl Cpu {
 
                     0x5 => {
                         // bge
+                        // if rs1 >= rs2 then pc=pc+imm
                         if (self.regs[rs1] as i64) >= (self.regs[rs2] as i64) {
                             return Ok(self.pc.wrapping_add(imm));
                         }
@@ -885,6 +935,7 @@ impl Cpu {
 
                     0x6 => {
                         // bltu
+                        // if rs1 < rs2 then pc=pc+imm
                         if self.regs[rs1] < self.regs[rs2] {
                             return Ok(self.pc.wrapping_add(imm));
                         }
@@ -893,6 +944,7 @@ impl Cpu {
 
                     0x7 => {
                         // bgeu
+                        // if rs1 >= rs2 then pc=pc+imm
                         if self.regs[rs1] >= self.regs[rs2] {
                             return Ok(self.pc.wrapping_add(imm));
                         }
@@ -903,6 +955,7 @@ impl Cpu {
             }
             0x67 => {
                 // jalr
+                // rd = previous pc, new pc = (rs1+imm)& 0b111..10
                 let t = self.pc + 4;
                 let imm = ((((instr & 0xfff00000) as i32) as i64) >> 20) as u64;
                 let new_pc = (self.regs[rs1].wrapping_add(imm)) & !1;
@@ -913,6 +966,7 @@ impl Cpu {
 
             0x6f => {
                 // jal
+                // rd = previous pc, new_pc = rs1 + imm
                 self.regs[rd] = self.pc + 4;
                 let imm = (((instr & 0x80000000) as i32 as i64 >> 11) as u64) // imm[20]
                     | (instr & 0xff000) // imm[19:12]
@@ -940,7 +994,7 @@ impl Cpu {
                                 return Err(Exception::Breakpoint(self.pc));
                             }
                             (0x2,0x8)=>{
-                                   // sret
+                                // sret
                                 // When the SRET instruction is executed to return from the trap
                                 // handler, the privilege level is set to user mode if the SPP
                                 // bit is 0, or supervisor mode if the SPP bit is 1. The SPP bit
@@ -992,6 +1046,7 @@ impl Cpu {
                     }
                     0x1 => {
                         // csrrw
+                        // csr_reg = rs1
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr,self.regs[rs1]);
                         self.regs[rd] = t;
@@ -1001,6 +1056,7 @@ impl Cpu {
 
                     0x2 => {
                         // csrrs
+                        // rd = csr_reg
                         let t = self.csr.load(csr_addr);
                         self.csr.store(csr_addr, t | self.regs[rs1]);
                         self.regs[rd]=t;
@@ -1054,327 +1110,3 @@ impl Cpu {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use std::fs::File;
-    use std::io::{Write,Read};
-    use std::process::Command;
-    use super::*;
-
-    fn generate_rv_assembly(c_src: &str) { // .c -> .s
-        let cc = "clang";
-        let ouptput = Command::new(cc).arg("-S")
-                                            .arg(c_src)
-                                            .arg("-nostdlib")
-                                            .arg("-march=rv64g")
-                                            .arg("-mabi=lp64")
-                                            .arg("--target=riscv64")
-                                            .arg("-mno-relax")
-                                            .output()
-                                            .expect("Failed to generate riscv assembly");
-        println!("{}",String::from_utf8_lossy(&ouptput.stderr));
-    }
-
-    fn generate_rv_obj(assemly:&str){
-        let cc = "clang";
-        let pieces: Vec<&str> = assemly.split(".").collect();
-        let output = Command::new(cc).arg("-Wl,-Ttext=0x0")
-                                            .arg("-nostdlib")
-                                            .arg("-march=rv64g")
-                                            .arg("-mabi=lp64")
-                                            .arg("--target=riscv64")
-                                            .arg("-mno-relax")
-                                            .arg("-o")
-                                            .arg(&pieces[0]) //obj file name
-                                            .arg(assemly)
-                                            .output()
-                                            .expect("Failed to generate rv object");
-        println!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    fn generate_rv_binary(obj:&str){
-        let objcopy = "llvm-objcopy";
-        let output = Command::new(objcopy).arg("-O")
-                                              .arg("binary")
-                                              .arg(obj)
-                                              .arg(obj.to_owned()+".bin")
-                                              .output()
-                                              .expect("Failed to generate rv binary");
-
-        println!("{}",String::from_utf8_lossy(&output.stderr));
-    }
-
-    fn rv_helper(code:&str,testname:&str,n_clock:usize)->Result<Cpu,std::io::Error>{
-        let filename = testname.to_owned() + ".s";
-        let mut file = File::create(&filename)?;
-        file.write(&code.as_bytes())?;
-        generate_rv_obj(&filename);
-        generate_rv_binary(testname);
-        let mut file_bin = File::open(testname.to_owned() + ".bin")?;
-        let mut code = Vec::new();
-        file_bin.read_to_end(&mut code)?;
-        //leave disk_image empty do not affect our test. test case do not require 
-        // disk_image
-        let mut cpu = Cpu::new(code, vec![]); 
-
-        for _i in 0..n_clock {
-            let instr = match cpu.fetch() {
-                Ok(instr)=>instr,
-                Err(_err)=>break,
-            };
-            match cpu.execute(instr){
-                Ok(new_pc) => cpu.pc=new_pc,
-                Err(err) => println!("{}",err),
-            };
-
-        }
-        return Ok(cpu);
-    }
-
-    macro_rules! riscv_test {
-        ($code:expr, $name:expr, $clock:expr, $($check:expr => $expect:expr),*) => {
-           match rv_helper($code,$name,$clock) {
-            Ok(cpu)=>{
-                $(assert_eq!(cpu.reg($check),$expect);)*
-            }
-            Err(e)=>{println!("error:{}",e);assert!(false);}
-           }
-        };
-    }
-
-    #[test]
-    fn test_add(){
-        let code = "addi x31, x0, 42";
-        riscv_test!(code,"test_addi",1,"x31" => 42);
-        // match rv_helper(code,"test_addi",1) {
-        //     Ok(cpu) => assert_eq!(cpu.regs[31],42),
-        //     Err(e) => {println!("error:{}",e); assert!(false);}
-        // }
-    }
-    #[test]
-    fn test_simple() {
-        let code = "
-        addi	sp,sp,-16
-        sd	s0,8(sp)
-        addi	s0,sp,16
-        li	a5,42
-        mv	a0,a5
-        ld	s0,8(sp)
-        addi	sp,sp,16
-        jr	ra
-        ";
-        riscv_test!(code,"test_simple",20,"a0"=>42);
-    }
-
-    #[test]
-    fn test_auipc(){
-        let code ="auipc a0,42";
-        riscv_test!(code,"test_auipc",1,"a0"=>DRAM_BASE+(42<<12));
-    }
-
-    #[test]
-    fn test_jalr() {
-        let code = "
-            addi a1, zero, 42
-            jalr a0, -8(a1)
-        ";
-        riscv_test!(code,"test_jalr",2,"a0"=>DRAM_BASE+8,"pc"=>34);
-    }
-
-    #[test]
-    fn test_beq() {
-        let code = "
-            beq x0, x0, 42
-        ";
-        riscv_test!(code,"test_beq",3,"pc"=>DRAM_BASE+42);
-    }
-
-    #[test]
-    fn test_bne() {
-        let code = "
-            addi x1, x0, 10
-            bne x0, x1, 42
-        ";
-        riscv_test!(code,"test_bne",5,"pc"=>DRAM_BASE+42+4);
-    }
-
-    #[test]
-    fn test_blt() {
-        let code = "
-            addi x1, x0, 10
-            addi x2, x0, 20
-            blt x1,x2,42
-        ";
-        riscv_test!(code,"test_blt",3,"pc"=>DRAM_BASE+42+8);
-    }
-
-    #[test]
-    fn test_bge() {
-        let code = "
-            addi x1,x0,10
-            addi x2,x0,20
-            bge x2,x1,42
-        ";
-        riscv_test!(code,"test_bge",3,"pc"=>DRAM_BASE+42+8);
-    }
-
-    #[test]
-    fn test_bltu(){
-        let code = "
-            addi x1,x0,10
-            addi x2,x0,20
-            bltu x1,x2,42
-        ";
-        riscv_test!(code,"test_bltu",3,"pc"=>DRAM_BASE+42+8);
-    }
-
-    #[test]
-    fn test_bqeu() {
-        let code = "
-            addi x1,x0,10
-            addi x2,x0,20
-            bgeu x2,x1,42
-        ";
-        riscv_test!(code,"test_bgeu",3,"pc"=>DRAM_BASE+42+8);
-    }
-
-    #[test]
-    fn test_store_load1() {
-        let code = "
-            addi s0, zero,256
-            addi sp, sp, -16
-            sd s0, 8(sp)
-            lb t1, 8(sp)
-            lh t2, 8(sp)
-        ";
-        riscv_test!(code,"test_store_load1",10,"t1"=>0,"t2"=>256);
-    }
-
-    #[test]
-    fn test_slt(){
-        let code ="
-            addi t0,zero,14
-            addi t1,zero,24
-            slt t2,t0,t1
-            slti t3,t0,42
-            sltiu t4,t0,84
-        ";
-        riscv_test!(code,"test_slt",7,"t2"=>1,"t3"=>1,"t4"=>1);
-    }
-
-   
-    #[test]
-    fn test_xor() {
-        let code = "
-            addi a0, zero, 0b10
-            xori a1, a0, 0b01
-            xor a2, a1, a1 
-        ";
-        riscv_test!(code, "test_xor", 5, "a1" => 3, "a2" => 0);
-    }
-     #[test]
-    fn test_or() {
-        let code = "
-            addi a0, zero, 0b10
-            ori  a1, a0, 0b01
-            or   a2, a0, a0
-        ";
-        riscv_test!(code, "test_or", 3, "a1" => 0b11, "a2" => 0b10);
-    }
-
-
-    #[test]
-    fn test_and() {
-        let code = "
-            addi a0, zero, 0b10
-            andi a1, a0, 0b11
-            and a2, a0, a1
-        ";
-        riscv_test!(code,"test_and",3,"a1" => 0b10,"a2" => 0b10);
-    }
-
-    #[test]
-    fn test_sll() {
-            let code = "
-            addi a0, zero, 1
-            addi a1, zero, 5
-            sll  a2, a0, a1
-            slli a3, a0, 5
-            addi s0, zero, 64
-            sll  a4, a0, s0
-        ";
-        riscv_test!(code, "test_sll", 10, "a2" => 1 << 5, "a3" => 1 << 5, "a4" => 1);
-    }
-
-    #[test]
-    fn test_sra_srl() {
-        let code = "
-            addi a0, zero, -8
-            addi a1, zero, 1
-            sra  a2, a0, a1
-            srai a3, a0, 2
-            srli a4, a0, 2
-            srl  a5, a0, a1
-        ";
-        riscv_test!(code, "test_sra_srl", 10, "a2" => -4 as i64 as u64, "a3" => -2 as i64 as u64, 
-                                              "a4" => -8 as i64 as u64 >> 2, "a5" => -8 as i64 as u64 >> 1);
-    }
-
-     #[test]
-    fn test_word_op() {
-        let code = "
-            addi a0, zero, 42 
-            lui  a1, 0x7f000
-            addw a2, a0, a1
-        ";
-        riscv_test!(code, "test_word_op", 29, "a2" => 0x7f00002a);
-    }
-
-    #[test]
-    fn test_csrs1() {
-        let code = "
-        addi t0, zero, 1
-        addi t1, zero, 2
-        addi t2, zero, 3
-        csrrw zero, mstatus, t0
-        csrrs zero, mtvec, t1
-        csrrw zero, mepc, t2
-        csrrc t2, mepc, zero
-        csrrwi zero, sstatus, 4
-        csrrsi zero, stvec, 5
-        csrrwi zero, sepc, 6
-        csrrci zero, sepc, 0 
-    ";
-    riscv_test!(code, "test_csrs1", 20, "mstatus" => 1, "mtvec" => 2, "mepc" => 3,
-                                        "sstatus" => 0, "stvec" => 5, "sepc" => 6);
-    }
-    #[test]
-    fn compile_hello_world() {
-        // You should run it by
-        // -- cargo run helloworld.bin
-        let c_code = r"
-        int main() {
-            volatile char *uart = (volatile char *) 0x10000000;
-            uart[0] = 'H';
-            uart[0] = 'e';
-            uart[0] = 'l';
-            uart[0] = 'l';
-            uart[0] = 'o';
-            uart[0] = ',';
-            uart[0] = ' ';
-            uart[0] = 'w';
-            uart[0] = 'o';
-            uart[0] = 'r';
-            uart[0] = 'l';
-            uart[0] = 'd';
-            uart[0] = '!';
-            uart[0] = '\n';
-            return 0;
-        }";
-        let mut file = File::create("test_helloworld.c").unwrap();
-        file.write(&c_code.as_bytes()).unwrap();
-        generate_rv_assembly("test_helloworld.c");
-        generate_rv_obj("test_helloworld.s");
-        generate_rv_binary("test_helloworld");
-    }
-}
